@@ -60,7 +60,7 @@ using android::base::ErrnoRestorer;
 static int check_log_uid_permissions() {
   uid_t uid = getuid();
 
-  /* Matches clientHasLogCredentials() in logd */
+  /* Matches clientCanWriteSecurityLog() in logd */
   if ((uid != AID_SYSTEM) && (uid != AID_ROOT) && (uid != AID_LOG)) {
     uid = geteuid();
     if ((uid != AID_SYSTEM) && (uid != AID_ROOT) && (uid != AID_LOG)) {
@@ -81,7 +81,8 @@ static int check_log_uid_permissions() {
           }
           num_groups = getgroups(num_groups, groups);
           while (num_groups > 0) {
-            if (groups[num_groups - 1] == AID_LOG) {
+            if (groups[num_groups - 1] == AID_LOG ||
+                groups[num_groups - 1] == AID_SECURITY_LOG_WRITER) {
               break;
             }
             --num_groups;
@@ -108,11 +109,10 @@ void __android_log_close() {
 #endif
 }
 
-#if defined(__GLIBC__) || defined(_WIN32)
+// BSD-based systems like Android/macOS have getprogname(). Others need us to provide one.
+#if !defined(__APPLE__) && !defined(__BIONIC__)
 static const char* getprogname() {
-#if defined(__GLIBC__)
-  return program_invocation_short_name;
-#elif defined(_WIN32)
+#ifdef _WIN32
   static bool first = true;
   static char progname[MAX_PATH] = {};
 
@@ -129,16 +129,18 @@ static const char* getprogname() {
   }
 
   return progname;
+#else
+  return program_invocation_short_name;
 #endif
 }
 #endif
 
 // It's possible for logging to happen during static initialization before our globals are
 // initialized, so we place this std::string in a function such that it is initialized on the first
-// call.
+// call. We use a pointer to avoid exit time destructors.
 std::string& GetDefaultTag() {
-  static std::string default_tag = getprogname();
-  return default_tag;
+  static std::string* default_tag = new std::string(getprogname());
+  return *default_tag;
 }
 
 void __android_log_set_default_tag(const char* tag) {
@@ -192,7 +194,7 @@ static int write_to_log(log_id_t log_id, struct iovec* vec, size_t nr) {
     return -EINVAL;
   }
 
-  clock_gettime(android_log_clockid(), &ts);
+  clock_gettime(CLOCK_REALTIME, &ts);
 
   if (log_id == LOG_ID_SECURITY) {
     if (vec[0].iov_len < 4) {
@@ -267,7 +269,7 @@ void __android_log_stderr_logger(const struct __android_log_message* log_message
             log_message->tag ? log_message->tag : "nullptr", priority_char, timestamp, getpid(),
             tid, log_message->file, log_message->line, log_message->message);
   } else {
-    fprintf(stderr, "%s %c %s %5d %5" PRIu64 " %s\n",
+    fprintf(stderr, "%s %c %s %5d %5" PRIu64 "] %s\n",
             log_message->tag ? log_message->tag : "nullptr", priority_char, timestamp, getpid(),
             tid, log_message->message);
   }
@@ -334,7 +336,7 @@ int __android_log_vprint(int prio, const char* tag, const char* fmt, va_list ap)
     return -EPERM;
   }
 
-  char buf[LOG_BUF_SIZE];
+  __attribute__((uninitialized)) char buf[LOG_BUF_SIZE];
 
   vsnprintf(buf, LOG_BUF_SIZE, fmt, ap);
 
@@ -352,7 +354,7 @@ int __android_log_print(int prio, const char* tag, const char* fmt, ...) {
   }
 
   va_list ap;
-  char buf[LOG_BUF_SIZE];
+  __attribute__((uninitialized)) char buf[LOG_BUF_SIZE];
 
   va_start(ap, fmt);
   vsnprintf(buf, LOG_BUF_SIZE, fmt, ap);
@@ -372,7 +374,7 @@ int __android_log_buf_print(int bufID, int prio, const char* tag, const char* fm
   }
 
   va_list ap;
-  char buf[LOG_BUF_SIZE];
+  __attribute__((uninitialized)) char buf[LOG_BUF_SIZE];
 
   va_start(ap, fmt);
   vsnprintf(buf, LOG_BUF_SIZE, fmt, ap);
@@ -385,7 +387,7 @@ int __android_log_buf_print(int bufID, int prio, const char* tag, const char* fm
 }
 
 void __android_log_assert(const char* cond, const char* tag, const char* fmt, ...) {
-  char buf[LOG_BUF_SIZE];
+  __attribute__((uninitialized)) char buf[LOG_BUF_SIZE];
 
   if (fmt) {
     va_list ap;

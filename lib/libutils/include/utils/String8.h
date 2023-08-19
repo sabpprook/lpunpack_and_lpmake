@@ -17,7 +17,8 @@
 #ifndef ANDROID_STRING8_H
 #define ANDROID_STRING8_H
 
-#include <string> // for std::string
+#include <iostream>
+#include <string>
 
 #include <utils/Errors.h>
 #include <utils/Unicode.h>
@@ -39,16 +40,7 @@ class String16;
 class String8
 {
 public:
-    /* use String8(StaticLinkage) if you're statically linking against
-     * libutils and declaring an empty static String8, e.g.:
-     *
-     *   static String8 sAStaticEmptyString(String8::kEmptyString);
-     *   static String8 sAnotherStaticEmptyString(sAStaticEmptyString);
-     */
-    enum StaticLinkage { kEmptyString };
-
                                 String8();
-    explicit                    String8(StaticLinkage);
                                 String8(const String8& o);
     explicit                    String8(const char* o);
     explicit                    String8(const char* o, size_t numChars);
@@ -138,22 +130,11 @@ public:
             bool                removeAll(const char* other);
 
             void                toLower();
-            void                toLower(size_t start, size_t numChars);
-            void                toUpper();
-            void                toUpper(size_t start, size_t numChars);
 
 
     /*
      * These methods operate on the string as if it were a path name.
      */
-
-    /*
-     * Set the filename field to a specific value.
-     *
-     * Normalizes the filename, removing a trailing '/' if present.
-     */
-    void setPathName(const char* name);
-    void setPathName(const char* name, size_t numChars);
 
     /*
      * Get just the filename component.
@@ -240,6 +221,11 @@ private:
 // String8 can be trivially moved using memcpy() because moving does not
 // require any change to the underlying SharedBuffer contents or reference count.
 ANDROID_TRIVIAL_MOVE_TRAIT(String8)
+
+static inline std::ostream& operator<<(std::ostream& os, const String8& str) {
+    os << str.c_str();
+    return os;
+}
 
 // ---------------------------------------------------------------------------
 // No user servicable parts below.

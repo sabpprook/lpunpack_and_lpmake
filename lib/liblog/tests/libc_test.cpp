@@ -22,6 +22,10 @@
 TEST(libc, __pstore_append) {
 #ifdef __ANDROID__
 #ifndef NO_PSTORE
+  if (access("/dev/pmsg0", W_OK) != 0) {
+    GTEST_SKIP() << "pmsg0 not found, skipping test";
+  }
+
   FILE* fp;
   ASSERT_TRUE(NULL != (fp = fopen("/dev/pmsg0", "ae")));
   static const char message[] = "libc.__pstore_append\n";
@@ -39,7 +43,7 @@ TEST(libc, __pstore_append) {
             "Kernel does not have space allocated to pmsg pstore driver "
             "configured\n");
   }
-  if (!fcloseReturn && !fcloseErrno && !fflushReturn && !fflushReturn) {
+  if (!fcloseReturn && !fcloseErrno && !fflushReturn && !fflushErrno) {
     fprintf(stderr,
             "Reboot, ensure string libc.__pstore_append is in "
             "/sys/fs/pstore/pmsg-ramoops-0\n");

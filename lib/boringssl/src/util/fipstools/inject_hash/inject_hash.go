@@ -21,7 +21,6 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
-	"crypto/sha512"
 	"debug/elf"
 	"encoding/binary"
 	"errors"
@@ -36,15 +35,23 @@ import (
 	"boringssl.googlesource.com/boringssl/util/fipstools/fipscommon"
 )
 
-func do(outPath, oInput string, arInput string, useSHA256 bool) error {
+func do(outPath, oInput string, arInput string) error {
 	var objectBytes []byte
 	var isStatic bool
+	var perm os.FileMode
+
 	if len(arInput) > 0 {
 		isStatic = true
 
 		if len(oInput) > 0 {
 			return fmt.Errorf("-in-archive and -in-object are mutually exclusive")
 		}
+
+		fi, err := os.Stat(arInput)
+		if err != nil {
+			return err
+		}
+		perm = fi.Mode()
 
 		arFile, err := os.Open(arInput)
 		if err != nil {
@@ -65,7 +72,12 @@ func do(outPath, oInput string, arInput string, useSHA256 bool) error {
 			objectBytes = contents
 		}
 	} else if len(oInput) > 0 {
-		var err error
+		fi, err := os.Stat(oInput)
+		if err != nil {
+			return err
+		}
+		perm = fi.Mode()
+
 		if objectBytes, err = ioutil.ReadFile(oInput); err != nil {
 			return err
 		}
@@ -203,11 +215,7 @@ func do(outPath, oInput string, arInput string, useSHA256 bool) error {
 	}
 
 	var zeroKey [64]byte
-	hashFunc := sha512.New
-	if useSHA256 {
-		hashFunc = sha256.New
-	}
-	mac := hmac.New(hashFunc, zeroKey[:])
+	mac := hmac.New(sha256.New, zeroKey[:])
 
 	if moduleROData != nil {
 		var lengthBytes [8]byte
@@ -237,18 +245,17 @@ func do(outPath, oInput string, arInput string, useSHA256 bool) error {
 
 	copy(objectBytes[offset:], calculated)
 
-	return ioutil.WriteFile(outPath, objectBytes, 0644)
+	return ioutil.WriteFile(outPath, objectBytes, perm & 0777)
 }
 
 func main() {
 	arInput := flag.String("in-archive", "", "Path to a .a file")
 	oInput := flag.String("in-object", "", "Path to a .o file")
 	outPath := flag.String("o", "", "Path to output object")
-	sha256 := flag.Bool("sha256", false, "Whether to use SHA-256 over SHA-512. This must match what the compiled module expects.")
 
 	flag.Parse()
 
-	if err := do(*outPath, *oInput, *arInput, *sha256); err != nil {
+	if err := do(*outPath, *oInput, *arInput); err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		os.Exit(1)
 	}

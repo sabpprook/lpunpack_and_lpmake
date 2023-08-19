@@ -6,6 +6,7 @@ add_executable(
   async_bio.cc
   bssl_shim.cc
   handshake_util.cc
+  mock_quic_transport.cc
   packeted_bio.cc
   settings_writer.cc
   test_config.cc
@@ -16,13 +17,14 @@ add_dependencies(bssl_shim global_target)
 
 target_link_libraries(bssl_shim test_support_lib ssl crypto)
 
-if(UNIX AND NOT APPLE AND NOT ANDROID)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(
     handshaker
 
     async_bio.cc
     handshake_util.cc
     handshaker.cc
+    mock_quic_transport.cc
     packeted_bio.cc
     settings_writer.cc
     test_config.cc

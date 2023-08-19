@@ -17,11 +17,11 @@
 #include <assert.h>
 
 #include <openssl/cipher.h>
-#include <openssl/cpu.h>
 #include <openssl/crypto.h>
 #include <openssl/err.h>
 
 #include "../fipsmodule/cipher/internal.h"
+#include "../internal.h"
 
 
 #define EVP_AEAD_AES_GCM_SIV_NONCE_LEN 12
@@ -723,6 +723,14 @@ static void gcm_siv_keys(
   }
 
   OPENSSL_memcpy(out_keys->auth_key, key_material, 16);
+  // Note the |ctr128_f| function uses a big-endian couner, while AES-GCM-SIV
+  // uses a little-endian counter. We ignore the return value and only use
+  // |block128_f|. This has a significant performance cost for the fallback
+  // bitsliced AES implementations (bsaes and aes_nohw).
+  //
+  // We currently do not consider AES-GCM-SIV to be performance-sensitive on
+  // client hardware. If this changes, we can write little-endian |ctr128_f|
+  // functions.
   aes_ctr_set_key(&out_keys->enc_key.ks, NULL, &out_keys->enc_block,
                   key_material + 16, gcm_siv_ctx->is_256 ? 32 : 16);
 }
@@ -849,22 +857,15 @@ static const EVP_AEAD aead_aes_256_gcm_siv = {
 
 #if defined(AES_GCM_SIV_ASM)
 
-static char avx_aesni_capable(void) {
-  const uint32_t ecx = OPENSSL_ia32cap_P[1];
-
-  return (ecx & (1 << (57 - 32))) != 0 /* AESNI */ &&
-         (ecx & (1 << 28)) != 0 /* AVX */;
-}
-
 const EVP_AEAD *EVP_aead_aes_128_gcm_siv(void) {
-  if (avx_aesni_capable()) {
+  if (CRYPTO_is_AVX_capable() && CRYPTO_is_AESNI_capable()) {
     return &aead_aes_128_gcm_siv_asm;
   }
   return &aead_aes_128_gcm_siv;
 }
 
 const EVP_AEAD *EVP_aead_aes_256_gcm_siv(void) {
-  if (avx_aesni_capable()) {
+  if (CRYPTO_is_AVX_capable() && CRYPTO_is_AESNI_capable()) {
     return &aead_aes_256_gcm_siv_asm;
   }
   return &aead_aes_256_gcm_siv;

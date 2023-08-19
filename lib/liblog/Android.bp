@@ -14,6 +14,22 @@
 // limitations under the License.
 //
 
+package {
+    default_applicable_licenses: ["system_logging_liblog_license"],
+}
+
+// Added automatically by a large-scale-change
+license {
+    name: "system_logging_liblog_license",
+    visibility: [":__subpackages__"],
+    license_kinds: [
+        "SPDX-license-identifier-Apache-2.0",
+    ],
+    license_text: [
+        "NOTICE",
+    ],
+}
+
 liblog_sources = [
     "log_event_list.cpp",
     "log_event_write.cpp",
@@ -36,13 +52,16 @@ cc_library_headers {
     name: "liblog_headers",
     host_supported: true,
     vendor_available: true,
+    product_available: true,
     ramdisk_available: true,
+    vendor_ramdisk_available: true,
     recovery_available: true,
     apex_available: [
         "//apex_available:platform",
         "//apex_available:anyapex",
     ],
     min_sdk_version: "29",
+    sdk_version: "minimum",
     native_bridge_supported: true,
     export_include_dirs: ["include"],
     system_shared_libs: [],
@@ -57,6 +76,9 @@ cc_library_headers {
         vendor: {
             override_export_include_dirs: ["include_vndk"],
         },
+        product: {
+            override_export_include_dirs: ["include_vndk"],
+        },
     },
 }
 
@@ -66,8 +88,13 @@ cc_library {
     name: "liblog",
     host_supported: true,
     ramdisk_available: true,
+    vendor_ramdisk_available: true,
     recovery_available: true,
     native_bridge_supported: true,
+    llndk: {
+        symbol_file: "liblog.map.txt",
+        override_export_include_dirs: ["include_vndk"],
+    },
     srcs: liblog_sources,
 
     target: {
@@ -97,6 +124,7 @@ cc_library {
 
     header_libs: [
         "libbase_headers",
+        "libcutils_headers",
         "liblog_headers",
     ],
     export_header_lib_headers: ["liblog_headers"],
@@ -110,6 +138,7 @@ cc_library {
         "-Wall",
         "-Werror",
         "-Wextra",
+        "-Wexit-time-destructors",
         // This is what we want to do:
         //  liblog_cflags := $(shell \
         //   sed -n \
@@ -118,9 +147,15 @@ cc_library {
         // so make sure we do not regret hard-coding it as follows:
         "-DLIBLOG_LOG_TAG=1006",
         "-DSNET_EVENT_LOG_TAG=1397638484",
+        "-DANDROID_DEBUGGABLE=0"
     ],
     logtags: ["event.logtags"],
     compile_multilib: "both",
+    product_variables: {
+        debuggable: {
+            cflags: ["-UANDROID_DEBUGGABLE", "-DANDROID_DEBUGGABLE=1"],
+        }
+    },
     apex_available: [
         "//apex_available:platform",
         // liblog is exceptionally available to the runtime APEX
@@ -129,6 +164,7 @@ cc_library {
         "com.android.runtime",
         // DO NOT add more apex names here
     ],
+    afdo: true,
 }
 
 ndk_headers {
@@ -146,9 +182,30 @@ ndk_library {
     unversioned_until: "current",
 }
 
-llndk_library {
-    name: "liblog",
-    native_bridge_supported: true,
-    symbol_file: "liblog.map.txt",
-    export_include_dirs: ["include_vndk"],
+rust_bindgen {
+    name: "liblog_event_list_bindgen",
+    wrapper_src: "rust/liblog_wrapper.h",
+    crate_name: "log_event_list_bindgen",
+    source_stem: "bindings",
+
+    bindgen_flags: [
+        "--size_t-is-usize",
+        "--allowlist-function=create_android_logger",
+        "--allowlist-function=android_log_destroy",
+        "--allowlist-function=android_log_write_int32",
+        "--allowlist-function=android_log_write_string8_len",
+        "--allowlist-function=android_log_write_list",
+        "--allowlist-function=__android_log_security",
+        "--allowlist-type=log_id",
+    ],
+}
+
+rust_test {
+    name: "liblog_event_list_bindgen_test",
+    srcs: [":liblog_event_list_bindgen"],
+    crate_name: "log_event_list_bindgen_test",
+    test_suites: ["general-tests"],
+    auto_gen_config: true,
+    clippy_lints: "none",
+    lints: "none",
 }

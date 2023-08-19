@@ -24,6 +24,8 @@
 
 #include <algorithm>
 
+#include <android-base/macros.h>
+
 #include <private/android_logger.h>
 
 #include "logger_write.h"
@@ -34,7 +36,7 @@
 
 static pthread_mutex_t lock_loggable = PTHREAD_MUTEX_INITIALIZER;
 
-static int lock() {
+static bool trylock() {
   /*
    * If we trigger a signal handler in the middle of locked activity and the
    * signal handler logs a message, we could get into a deadlock state.
@@ -44,7 +46,7 @@ static int lock() {
    * in less time than the system call associated with a mutex to deal with
    * the contention.
    */
-  return pthread_mutex_trylock(&lock_loggable);
+  return pthread_mutex_trylock(&lock_loggable) == 0;
 }
 
 static void unlock() {
@@ -93,22 +95,13 @@ static void refresh_cache(struct cache_char* cache, const char* key) {
   }
 }
 
-static int __android_log_level(const char* tag, size_t len) {
-  /* sizeof() is used on this array below */
-  static const char log_namespace[] = "persist.log.tag.";
-  static const size_t base_offset = 8; /* skip "persist." */
-
-  if (tag == nullptr || len == 0) {
+static int __android_log_level(const char* tag, size_t tag_len) {
+  if (tag == nullptr || tag_len == 0) {
     auto& tag_string = GetDefaultTag();
     tag = tag_string.c_str();
-    len = tag_string.size();
+    tag_len = tag_string.size();
   }
 
-  /* sizeof(log_namespace) = strlen(log_namespace) + 1 */
-  char key[sizeof(log_namespace) + len];
-  char* kp;
-  size_t i;
-  char c = 0;
   /*
    * Single layer cache of four properties. Priorities are:
    *    log.tag.<tag>
@@ -118,95 +111,73 @@ static int __android_log_level(const char* tag, size_t len) {
    * Where the missing tag matches all tags and becomes the
    * system global default. We do not support ro.log.tag* .
    */
-  static char* last_tag;
-  static size_t last_tag_len;
+  static std::string* last_tag = new std::string;
   static uint32_t global_serial;
-  /* some compilers erroneously see uninitialized use. !not_locked */
-  uint32_t current_global_serial = 0;
-  static struct cache_char tag_cache[2];
-  static struct cache_char global_cache[2];
-  int change_detected;
-  int global_change_detected;
-  int not_locked;
+  uint32_t current_global_serial;
+  static cache_char tag_cache[2];
+  static cache_char global_cache[2];
 
+  static const char* log_namespace = "persist.log.tag.";
+  char key[strlen(log_namespace) + tag_len + 1];
   strcpy(key, log_namespace);
 
-  global_change_detected = change_detected = not_locked = lock();
+  bool locked = trylock();
+  bool change_detected, global_change_detected;
+  global_change_detected = change_detected = !locked;
 
-  if (!not_locked) {
-    /*
-     *  check all known serial numbers to changes.
-     */
-    for (i = 0; i < (sizeof(tag_cache) / sizeof(tag_cache[0])); ++i) {
+  char c = 0;
+  if (locked) {
+    // Check all known serial numbers for changes.
+    for (size_t i = 0; i < arraysize(tag_cache); ++i) {
       if (check_cache(&tag_cache[i].cache)) {
-        change_detected = 1;
+        change_detected = true;
       }
     }
-    for (i = 0; i < (sizeof(global_cache) / sizeof(global_cache[0])); ++i) {
+    for (size_t i = 0; i < arraysize(global_cache); ++i) {
       if (check_cache(&global_cache[i].cache)) {
-        global_change_detected = 1;
+        global_change_detected = true;
       }
     }
 
     current_global_serial = __system_property_area_serial();
     if (current_global_serial != global_serial) {
-      change_detected = 1;
-      global_change_detected = 1;
+      global_change_detected = change_detected = true;
     }
   }
 
-  if (len) {
-    int local_change_detected = change_detected;
-    if (!not_locked) {
-      if (!last_tag || !last_tag[0] || (last_tag[0] != tag[0]) ||
-          strncmp(last_tag + 1, tag + 1, last_tag_len - 1)) {
-        /* invalidate log.tag.<tag> cache */
-        for (i = 0; i < (sizeof(tag_cache) / sizeof(tag_cache[0])); ++i) {
+  if (tag_len != 0) {
+    bool local_change_detected = change_detected;
+    if (locked) {
+      // compare() rather than == because tag isn't guaranteed 0-terminated.
+      if (last_tag->compare(0, last_tag->size(), tag, tag_len) != 0) {
+        // Invalidate log.tag.<tag> cache.
+        for (size_t i = 0; i < arraysize(tag_cache); ++i) {
           tag_cache[i].cache.pinfo = NULL;
           tag_cache[i].c = '\0';
         }
-        if (last_tag) last_tag[0] = '\0';
-        local_change_detected = 1;
-      }
-      if (!last_tag || !last_tag[0]) {
-        if (!last_tag) {
-          last_tag = static_cast<char*>(calloc(1, len + 1));
-          last_tag_len = 0;
-          if (last_tag) last_tag_len = len + 1;
-        } else if (len >= last_tag_len) {
-          last_tag = static_cast<char*>(realloc(last_tag, len + 1));
-          last_tag_len = 0;
-          if (last_tag) last_tag_len = len + 1;
-        }
-        if (last_tag) {
-          strncpy(last_tag, tag, len);
-          last_tag[len] = '\0';
-        }
+        last_tag->assign(tag, tag_len);
+        local_change_detected = true;
       }
     }
-    strncpy(key + sizeof(log_namespace) - 1, tag, len);
-    key[sizeof(log_namespace) - 1 + len] = '\0';
+    *stpncpy(key + strlen(log_namespace), tag, tag_len) = '\0';
 
-    kp = key;
-    for (i = 0; i < (sizeof(tag_cache) / sizeof(tag_cache[0])); ++i) {
-      struct cache_char* cache = &tag_cache[i];
-      struct cache_char temp_cache;
+    for (size_t i = 0; i < arraysize(tag_cache); ++i) {
+      cache_char* cache = &tag_cache[i];
+      cache_char temp_cache;
 
-      if (not_locked) {
+      if (!locked) {
         temp_cache.cache.pinfo = NULL;
         temp_cache.c = '\0';
         cache = &temp_cache;
       }
       if (local_change_detected) {
-        refresh_cache(cache, kp);
+        refresh_cache(cache, i == 0 ? key : key + strlen("persist."));
       }
 
       if (cache->c) {
         c = cache->c;
         break;
       }
-
-      kp = key + base_offset;
     }
   }
 
@@ -223,36 +194,33 @@ static int __android_log_level(const char* tag, size_t len) {
       break;
     default:
       /* clear '.' after log.tag */
-      key[sizeof(log_namespace) - 2] = '\0';
+      key[strlen(log_namespace) - 1] = '\0';
 
-      kp = key;
-      for (i = 0; i < (sizeof(global_cache) / sizeof(global_cache[0])); ++i) {
-        struct cache_char* cache = &global_cache[i];
-        struct cache_char temp_cache;
+      for (size_t i = 0; i < arraysize(global_cache); ++i) {
+        cache_char* cache = &global_cache[i];
+        cache_char temp_cache;
 
-        if (not_locked) {
+        if (!locked) {
           temp_cache = *cache;
-          if (temp_cache.cache.pinfo != cache->cache.pinfo) { /* check atomic */
+          if (temp_cache.cache.pinfo != cache->cache.pinfo) {  // check atomic
             temp_cache.cache.pinfo = NULL;
             temp_cache.c = '\0';
           }
           cache = &temp_cache;
         }
         if (global_change_detected) {
-          refresh_cache(cache, kp);
+          refresh_cache(cache, i == 0 ? key : key + strlen("persist."));
         }
 
         if (cache->c) {
           c = cache->c;
           break;
         }
-
-        kp = key + base_offset;
       }
       break;
   }
 
-  if (!not_locked) {
+  if (locked) {
     global_serial = current_global_serial;
     unlock();
   }
@@ -294,33 +262,12 @@ int __android_log_is_loggable(int prio, const char* tag, int default_prio) {
 }
 
 int __android_log_is_debuggable() {
-  static uint32_t serial;
-  static struct cache_char tag_cache;
-  static const char key[] = "ro.debuggable";
-  int ret;
+  static int is_debuggable = [] {
+    char value[PROP_VALUE_MAX] = {};
+    return __system_property_get("ro.debuggable", value) > 0 && !strcmp(value, "1");
+  }();
 
-  if (tag_cache.c) { /* ro property does not change after set */
-    ret = tag_cache.c == '1';
-  } else if (lock()) {
-    struct cache_char temp_cache = {{NULL, 0xFFFFFFFF}, '\0'};
-    refresh_cache(&temp_cache, key);
-    ret = temp_cache.c == '1';
-  } else {
-    int change_detected = check_cache(&tag_cache.cache);
-    uint32_t current_serial = __system_property_area_serial();
-    if (current_serial != serial) {
-      change_detected = 1;
-    }
-    if (change_detected) {
-      refresh_cache(&tag_cache, key);
-      serial = current_serial;
-    }
-    ret = tag_cache.c == '1';
-
-    unlock();
-  }
-
-  return ret;
+  return is_debuggable;
 }
 
 /*
@@ -365,29 +312,6 @@ static inline unsigned char do_cache2_char(struct cache2_char* self) {
   return c;
 }
 
-static unsigned char evaluate_persist_ro(const struct cache2_char* self) {
-  unsigned char c = self->cache_persist.c;
-
-  if (c) {
-    return c;
-  }
-
-  return self->cache_ro.c;
-}
-
-/*
- * Timestamp state generally remains constant, but can change at any time
- * to handle developer requirements.
- */
-clockid_t android_log_clockid() {
-  static struct cache2_char clockid = {PTHREAD_MUTEX_INITIALIZER, 0,
-                                       "persist.logd.timestamp",  {{NULL, 0xFFFFFFFF}, '\0'},
-                                       "ro.logd.timestamp",       {{NULL, 0xFFFFFFFF}, '\0'},
-                                       evaluate_persist_ro};
-
-  return (tolower(do_cache2_char(&clockid)) == 'm') ? CLOCK_MONOTONIC : CLOCK_REALTIME;
-}
-
 /*
  * Security state generally remains constant, but the DO must be able
  * to turn off logging should it become spammy after an attack is detected.
@@ -406,245 +330,6 @@ int __android_log_security() {
       evaluate_security};
 
   return do_cache2_char(&security);
-}
-
-/*
- * Interface that represents the logd buffer size determination so that others
- * need not guess our intentions.
- */
-
-/* Property helper */
-static bool check_flag(const char* prop, const char* flag) {
-  const char* cp = strcasestr(prop, flag);
-  if (!cp) {
-    return false;
-  }
-  /* We only will document comma (,) */
-  static const char sep[] = ",:;|+ \t\f";
-  if ((cp != prop) && !strchr(sep, cp[-1])) {
-    return false;
-  }
-  cp += strlen(flag);
-  return !*cp || !!strchr(sep, *cp);
-}
-
-/* cache structure */
-struct cache_property {
-  struct cache cache;
-  char property[PROP_VALUE_MAX];
-};
-
-static void refresh_cache_property(struct cache_property* cache, const char* key) {
-  if (!cache->cache.pinfo) {
-    cache->cache.pinfo = __system_property_find(key);
-    if (!cache->cache.pinfo) {
-      return;
-    }
-  }
-  cache->cache.serial = __system_property_serial(cache->cache.pinfo);
-  __system_property_read(cache->cache.pinfo, 0, cache->property);
-}
-
-/* get boolean with the logger twist that supports eng adjustments */
-bool __android_logger_property_get_bool(const char* key, int flag) {
-  struct cache_property property = {{NULL, 0xFFFFFFFF}, {0}};
-  if (flag & BOOL_DEFAULT_FLAG_PERSIST) {
-    char newkey[strlen("persist.") + strlen(key) + 1];
-    snprintf(newkey, sizeof(newkey), "ro.%s", key);
-    refresh_cache_property(&property, newkey);
-    property.cache.pinfo = NULL;
-    property.cache.serial = 0xFFFFFFFF;
-    snprintf(newkey, sizeof(newkey), "persist.%s", key);
-    refresh_cache_property(&property, newkey);
-    property.cache.pinfo = NULL;
-    property.cache.serial = 0xFFFFFFFF;
-  }
-
-  refresh_cache_property(&property, key);
-
-  if (check_flag(property.property, "true")) {
-    return true;
-  }
-  if (check_flag(property.property, "false")) {
-    return false;
-  }
-  if (property.property[0]) {
-    flag &= ~(BOOL_DEFAULT_FLAG_ENG | BOOL_DEFAULT_FLAG_SVELTE);
-  }
-  if (check_flag(property.property, "eng")) {
-    flag |= BOOL_DEFAULT_FLAG_ENG;
-  }
-  /* this is really a "not" flag */
-  if (check_flag(property.property, "svelte")) {
-    flag |= BOOL_DEFAULT_FLAG_SVELTE;
-  }
-
-  /* Sanity Check */
-  if (flag & (BOOL_DEFAULT_FLAG_SVELTE | BOOL_DEFAULT_FLAG_ENG)) {
-    flag &= ~BOOL_DEFAULT_FLAG_TRUE_FALSE;
-    flag |= BOOL_DEFAULT_TRUE;
-  }
-
-  if ((flag & BOOL_DEFAULT_FLAG_SVELTE) &&
-      __android_logger_property_get_bool("ro.config.low_ram", BOOL_DEFAULT_FALSE)) {
-    return false;
-  }
-  if ((flag & BOOL_DEFAULT_FLAG_ENG) && !__android_log_is_debuggable()) {
-    return false;
-  }
-
-  return (flag & BOOL_DEFAULT_FLAG_TRUE_FALSE) != BOOL_DEFAULT_FALSE;
-}
-
-bool __android_logger_valid_buffer_size(unsigned long value) {
-  static long pages, pagesize;
-  unsigned long maximum;
-
-  if ((value < LOG_BUFFER_MIN_SIZE) || (LOG_BUFFER_MAX_SIZE < value)) {
-    return false;
-  }
-
-  if (!pages) {
-    pages = sysconf(_SC_PHYS_PAGES);
-  }
-  if (pages < 1) {
-    return true;
-  }
-
-  if (!pagesize) {
-    pagesize = sysconf(_SC_PAGESIZE);
-    if (pagesize <= 1) {
-      pagesize = PAGE_SIZE;
-    }
-  }
-
-  /* maximum memory impact a somewhat arbitrary ~3% */
-  pages = (pages + 31) / 32;
-  maximum = pages * pagesize;
-
-  if ((maximum < LOG_BUFFER_MIN_SIZE) || (LOG_BUFFER_MAX_SIZE < maximum)) {
-    return true;
-  }
-
-  return value <= maximum;
-}
-
-struct cache2_property_size {
-  pthread_mutex_t lock;
-  uint32_t serial;
-  const char* key_persist;
-  struct cache_property cache_persist;
-  const char* key_ro;
-  struct cache_property cache_ro;
-  unsigned long (*const evaluate)(const struct cache2_property_size* self);
-};
-
-static inline unsigned long do_cache2_property_size(struct cache2_property_size* self) {
-  uint32_t current_serial;
-  int change_detected;
-  unsigned long v;
-
-  if (pthread_mutex_trylock(&self->lock)) {
-    /* We are willing to accept some race in this context */
-    return self->evaluate(self);
-  }
-
-  change_detected = check_cache(&self->cache_persist.cache) || check_cache(&self->cache_ro.cache);
-  current_serial = __system_property_area_serial();
-  if (current_serial != self->serial) {
-    change_detected = 1;
-  }
-  if (change_detected) {
-    refresh_cache_property(&self->cache_persist, self->key_persist);
-    refresh_cache_property(&self->cache_ro, self->key_ro);
-    self->serial = current_serial;
-  }
-  v = self->evaluate(self);
-
-  pthread_mutex_unlock(&self->lock);
-
-  return v;
-}
-
-static unsigned long property_get_size_from_cache(const struct cache_property* cache) {
-  char* cp;
-  unsigned long value = strtoul(cache->property, &cp, 10);
-
-  switch (*cp) {
-    case 'm':
-    case 'M':
-      value *= 1024;
-      [[fallthrough]];
-    case 'k':
-    case 'K':
-      value *= 1024;
-      [[fallthrough]];
-    case '\0':
-      break;
-
-    default:
-      value = 0;
-  }
-
-  if (!__android_logger_valid_buffer_size(value)) {
-    value = 0;
-  }
-
-  return value;
-}
-
-static unsigned long evaluate_property_get_size(const struct cache2_property_size* self) {
-  unsigned long size = property_get_size_from_cache(&self->cache_persist);
-  if (size) {
-    return size;
-  }
-  return property_get_size_from_cache(&self->cache_ro);
-}
-
-unsigned long __android_logger_get_buffer_size(log_id_t logId) {
-  static const char global_tunable[] = "persist.logd.size"; /* Settings App */
-  static const char global_default[] = "ro.logd.size";      /* BoardConfig.mk */
-  static struct cache2_property_size global = {
-      /* clang-format off */
-    PTHREAD_MUTEX_INITIALIZER, 0,
-    global_tunable, { { NULL, 0xFFFFFFFF }, {} },
-    global_default, { { NULL, 0xFFFFFFFF }, {} },
-    evaluate_property_get_size
-      /* clang-format on */
-  };
-  char key_persist[strlen(global_tunable) + strlen(".security") + 1];
-  char key_ro[strlen(global_default) + strlen(".security") + 1];
-  struct cache2_property_size local = {
-      /* clang-format off */
-    PTHREAD_MUTEX_INITIALIZER, 0,
-    key_persist, { { NULL, 0xFFFFFFFF }, {} },
-    key_ro,      { { NULL, 0xFFFFFFFF }, {} },
-    evaluate_property_get_size
-      /* clang-format on */
-  };
-  unsigned long property_size, default_size;
-
-  default_size = do_cache2_property_size(&global);
-  if (!default_size) {
-    default_size = __android_logger_property_get_bool("ro.config.low_ram", BOOL_DEFAULT_FALSE)
-                       ? LOG_BUFFER_MIN_SIZE /* 64K  */
-                       : LOG_BUFFER_SIZE;    /* 256K */
-  }
-
-  snprintf(key_persist, sizeof(key_persist), "%s.%s", global_tunable,
-           android_log_id_to_name(logId));
-  snprintf(key_ro, sizeof(key_ro), "%s.%s", global_default, android_log_id_to_name(logId));
-  property_size = do_cache2_property_size(&local);
-
-  if (!property_size) {
-    property_size = default_size;
-  }
-
-  if (!property_size) {
-    property_size = LOG_BUFFER_SIZE;
-  }
-
-  return property_size;
 }
 
 #else

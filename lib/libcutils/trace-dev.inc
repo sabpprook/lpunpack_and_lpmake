@@ -21,6 +21,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <fnmatch.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -51,7 +52,6 @@ constexpr uint32_t kSeqNoNotInit = static_cast<uint32_t>(-1);
 atomic_bool              atrace_is_ready      = ATOMIC_VAR_INIT(false);
 int                      atrace_marker_fd     = -1;
 uint64_t                 atrace_enabled_tags  = ATRACE_TAG_NOT_READY;
-static bool              atrace_is_debuggable = false;
 static atomic_bool       atrace_is_enabled    = ATOMIC_VAR_INIT(true);
 static pthread_mutex_t   atrace_tags_mutex    = PTHREAD_MUTEX_INITIALIZER;
 
@@ -95,15 +95,6 @@ uint64_t atrace_get_enabled_tags()
     return atrace_enabled_tags;
 }
 
-// Set whether this process is debuggable, which determines whether
-// application-level tracing is allowed when the ro.debuggable system property
-// is not set to '1'.
-void atrace_set_debuggable(bool debuggable)
-{
-    atrace_is_debuggable = debuggable;
-    atrace_update_tags();
-}
-
 // Check whether the given command line matches one of the comma-separated
 // values listed in the app_cmdlines property.
 static bool atrace_is_cmdline_match(const char* cmdline)
@@ -116,7 +107,7 @@ static bool atrace_is_cmdline_match(const char* cmdline)
     for (int i = 0; i < count; i++) {
         snprintf(buf, sizeof(buf), "debug.atrace.app_%d", i);
         property_get(buf, value, "");
-        if (strcmp(value, "*") == 0 || strcmp(value, cmdline) == 0) {
+        if (fnmatch(value, cmdline, FNM_NOESCAPE) == 0) {
             return true;
         }
     }
@@ -127,24 +118,21 @@ static bool atrace_is_cmdline_match(const char* cmdline)
 // Determine whether application-level tracing is enabled for this process.
 static bool atrace_is_app_tracing_enabled()
 {
-    bool sys_debuggable = property_get_bool("ro.debuggable", 0);
     bool result = false;
 
-    if (sys_debuggable || atrace_is_debuggable) {
-        // Check whether tracing is enabled for this process.
-        FILE * file = fopen("/proc/self/cmdline", "re");
-        if (file) {
-            char cmdline[4096];
-            if (fgets(cmdline, sizeof(cmdline), file)) {
-                result = atrace_is_cmdline_match(cmdline);
-            } else {
-                ALOGE("Error reading cmdline: %s (%d)", strerror(errno), errno);
-            }
-            fclose(file);
+    // Check whether tracing is enabled for this process.
+    FILE * file = fopen("/proc/self/cmdline", "re");
+    if (file) {
+        char cmdline[4096];
+        if (fgets(cmdline, sizeof(cmdline), file)) {
+            result = atrace_is_cmdline_match(cmdline);
         } else {
-            ALOGE("Error opening /proc/self/cmdline: %s (%d)", strerror(errno),
-                    errno);
+            ALOGE("Error reading cmdline: %s (%d)", strerror(errno), errno);
         }
+        fclose(file);
+    } else {
+        ALOGE("Error opening /proc/self/cmdline: %s (%d)", strerror(errno),
+                errno);
     }
 
     return result;
@@ -197,21 +185,36 @@ void atrace_update_tags()
     }
 }
 
-#define WRITE_MSG(format_begin, format_end, name, value) { \
+#define WRITE_MSG(format_begin, format_end, track_name, name, value) { \
     char buf[ATRACE_MESSAGE_LENGTH] __attribute__((uninitialized));     \
+    const char* track_name_sep = track_name[0] != '\0' ? "|" : ""; \
     int pid = getpid(); \
-    int len = snprintf(buf, sizeof(buf), format_begin "%s" format_end, pid, \
-        name, value); \
+    int len = snprintf(buf, sizeof(buf), format_begin "%s%s%s" format_end, pid, \
+        track_name, track_name_sep, name, value); \
     if (len >= (int) sizeof(buf)) { \
-        /* Given the sizeof(buf), and all of the current format buffers, \
-         * it is impossible for name_len to be < 0 if len >= sizeof(buf). */ \
         int name_len = strlen(name) - (len - sizeof(buf)) - 1; \
         /* Truncate the name to make the message fit. */ \
-        ALOGW("Truncated name in %s: %s\n", __FUNCTION__, name); \
-        len = snprintf(buf, sizeof(buf), format_begin "%.*s" format_end, pid, \
-            name_len, name, value); \
+        if (name_len > 0) { \
+            len = snprintf(buf, sizeof(buf), format_begin "%s%s%.*s" format_end, pid, \
+                track_name, track_name_sep, name_len, name, value); \
+        } else { \
+            int track_name_len = 0; \
+            if (track_name[0] != '\0') { \
+                track_name_len = strlen(track_name) - (len - strlen(name) - sizeof(buf)) - 2; \
+            } \
+            if (track_name_len <= 0) { \
+                /* Data is still too long. Drop it. */ \
+                len = 0; \
+            } else { \
+                /* Truncate the trackName and name to make the message fit */ \
+                len = snprintf(buf, sizeof(buf), format_begin "%.*s|%.1s" format_end, pid, \
+                    track_name_len, track_name, name, value); \
+            } \
+        } \
     } \
-    write(atrace_marker_fd, buf, len); \
+    if (len > 0) { \
+        write(atrace_marker_fd, buf, len); \
+    } \
 }
 
 #endif  // __TRACE_DEV_INC

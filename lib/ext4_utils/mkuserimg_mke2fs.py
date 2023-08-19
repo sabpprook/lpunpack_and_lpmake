@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright (C) 2018 The Android Open Source Project
 #
@@ -35,15 +35,32 @@ def RunCommand(cmd, env):
   env_copy = os.environ.copy()
   env_copy.update(env)
 
+  cmd[0] = FindProgram(cmd[0])
+
   logging.info("Env: %s", env)
   logging.info("Running: " + " ".join(cmd))
 
   p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                       env=env_copy)
+                       env=env_copy, text=True)
   output, _ = p.communicate()
 
   return output, p.returncode
 
+def FindProgram(prog_name):
+  """Finds the path to prog_name.
+
+  Args:
+    prog_name: the program name to find.
+  Returns:
+    path to the progName if found. The program is searched in the same directory
+    where this script is located at. If not found, progName is returned.
+  """
+  exec_dir = os.path.dirname(os.path.realpath(sys.argv[0]))
+  prog_path = os.path.join(exec_dir, prog_name)
+  if os.path.exists(prog_path):
+    return prog_path
+  else:
+    return prog_name
 
 def ParseArguments(argv):
   """Parses the input arguments to the program."""
@@ -148,11 +165,11 @@ def ConstructE2fsCommands(args):
 
   if args.flash_erase_block_size:
     mke2fs_extended_opts.append("stripe_width={}".format(
-        int(args.flash_erase_block_size) / BLOCKSIZE))
+        int(args.flash_erase_block_size) // BLOCKSIZE))
   if args.flash_logical_block_size:
     # stride should be the max of 8kb and the logical block size
     stride = max(int(args.flash_logical_block_size), 8192)
-    mke2fs_extended_opts.append("stride={}".format(stride / BLOCKSIZE))
+    mke2fs_extended_opts.append("stride={}".format(stride // BLOCKSIZE))
   if args.mke2fs_hash_seed:
     mke2fs_extended_opts.append("hash_seed=" + args.mke2fs_hash_seed)
 
@@ -177,7 +194,7 @@ def ConstructE2fsCommands(args):
     mke2fs_opts += ["-E", ','.join(mke2fs_extended_opts)]
 
   # Round down the filesystem length to be a multiple of the block size
-  blocks = int(args.fs_size) / BLOCKSIZE
+  blocks = int(args.fs_size) // BLOCKSIZE
   mke2fs_cmd = (["mke2fs"] + mke2fs_opts +
                 ["-t", args.ext_variant, "-b", str(BLOCKSIZE), args.output_file,
                  str(blocks)])

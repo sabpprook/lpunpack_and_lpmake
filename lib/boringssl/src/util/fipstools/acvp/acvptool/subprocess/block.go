@@ -1,3 +1,17 @@
+// Copyright (c) 2019, Google Inc.
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+// SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+// WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+// OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
 package subprocess
 
 import (
@@ -6,13 +20,116 @@ import (
 	"fmt"
 )
 
+// aesKeyShuffle is the "AES Monte Carlo Key Shuffle" from the ACVP
+// specification.
+func aesKeyShuffle(key, result, prevResult []byte) {
+	switch len(key) {
+	case 16:
+		for i := range key {
+			key[i] ^= result[i]
+		}
+	case 24:
+		for i := 0; i < 8; i++ {
+			key[i] ^= prevResult[i+8]
+		}
+		for i := range result {
+			key[i+8] ^= result[i]
+		}
+	case 32:
+		for i, b := range prevResult {
+			key[i] ^= b
+		}
+		for i, b := range result {
+			key[i+16] ^= b
+		}
+	default:
+		panic("unhandled key length")
+	}
+}
+
+// iterateAES implements the "AES Monte Carlo Test - ECB mode" from the ACVP
+// specification.
+func iterateAES(transact func(n int, args ...[]byte) ([][]byte, error), encrypt bool, key, input, iv []byte) (mctResults []blockCipherMCTResult) {
+	for i := 0; i < 100; i++ {
+		var iteration blockCipherMCTResult
+		iteration.KeyHex = hex.EncodeToString(key)
+		if encrypt {
+			iteration.PlaintextHex = hex.EncodeToString(input)
+		} else {
+			iteration.CiphertextHex = hex.EncodeToString(input)
+		}
+
+		results, err := transact(2, key, input, uint32le(1000))
+		if err != nil {
+			panic(err)
+		}
+		input = results[0]
+		prevResult := results[1]
+
+		if encrypt {
+			iteration.CiphertextHex = hex.EncodeToString(input)
+		} else {
+			iteration.PlaintextHex = hex.EncodeToString(input)
+		}
+
+		aesKeyShuffle(key, input, prevResult)
+		mctResults = append(mctResults, iteration)
+	}
+
+	return mctResults
+}
+
+// iterateAESCBC implements the "AES Monte Carlo Test - CBC mode" from the ACVP
+// specification.
+func iterateAESCBC(transact func(n int, args ...[]byte) ([][]byte, error), encrypt bool, key, input, iv []byte) (mctResults []blockCipherMCTResult) {
+	for i := 0; i < 100; i++ {
+		var iteration blockCipherMCTResult
+		iteration.KeyHex = hex.EncodeToString(key)
+		if encrypt {
+			iteration.PlaintextHex = hex.EncodeToString(input)
+		} else {
+			iteration.CiphertextHex = hex.EncodeToString(input)
+		}
+
+		iteration.IVHex = hex.EncodeToString(iv)
+
+		results, err := transact(2, key, input, iv, uint32le(1000))
+		if err != nil {
+			panic("block operation failed")
+		}
+
+		result := results[0]
+		prevResult := results[1]
+
+		if encrypt {
+			iteration.CiphertextHex = hex.EncodeToString(result)
+		} else {
+			iteration.PlaintextHex = hex.EncodeToString(result)
+		}
+
+		aesKeyShuffle(key, result, prevResult)
+
+		iv = result
+		input = prevResult
+
+		mctResults = append(mctResults, iteration)
+	}
+
+	return mctResults
+}
+
 // blockCipher implements an ACVP algorithm by making requests to the subprocess
 // to encrypt and decrypt with a block cipher.
 type blockCipher struct {
 	algo      string
 	blockSize int
-	hasIV     bool
-	m         *Subprocess
+	// numResults is the number of values returned by the wrapper. The one-shot
+	// tests always take the first value as the result, but the mctFunc may use
+	// them all.
+	numResults              int
+	inputsAreBlockMultiples bool
+	hasIV                   bool
+	mctFunc                 func(transact func(n int, args ...[]byte) ([][]byte, error), encrypt bool, key, input, iv []byte) (result []blockCipherMCTResult)
 }
 
 type blockCipherVectorSet struct {
@@ -25,11 +142,12 @@ type blockCipherTestGroup struct {
 	Direction string `json:"direction"`
 	KeyBits   int    `json:"keylen"`
 	Tests     []struct {
-		ID            uint64 `json:"tcId"`
-		PlaintextHex  string `json:"pt"`
-		CiphertextHex string `json:"ct"`
-		IVHex         string `json:"iv"`
-		KeyHex        string `json:"key"`
+		ID            uint64  `json:"tcId"`
+		InputBits     *uint64 `json:"payloadLen"`
+		PlaintextHex  string  `json:"pt"`
+		CiphertextHex string  `json:"ct"`
+		IVHex         string  `json:"iv"`
+		KeyHex        string  `json:"key"`
 	} `json:"tests"`
 }
 
@@ -46,13 +164,13 @@ type blockCipherTestResponse struct {
 }
 
 type blockCipherMCTResult struct {
-	KeyHex        string `json:"key"`
+	KeyHex        string `json:"key,omitempty"`
 	PlaintextHex  string `json:"pt"`
 	CiphertextHex string `json:"ct"`
 	IVHex         string `json:"iv,omitempty"`
 }
 
-func (b *blockCipher) Process(vectorSet []byte) (interface{}, error) {
+func (b *blockCipher) Process(vectorSet []byte, m Transactable) (interface{}, error) {
 	var parsed blockCipherVectorSet
 	if err := json.Unmarshal(vectorSet, &parsed); err != nil {
 		return nil, err
@@ -84,9 +202,12 @@ func (b *blockCipher) Process(vectorSet []byte) (interface{}, error) {
 
 		var mct bool
 		switch group.Type {
-		case "AFT":
+		case "AFT", "CTR":
 			mct = false
 		case "MCT":
+			if b.mctFunc == nil {
+				return nil, fmt.Errorf("test group %d has type MCT which is unsupported for %q", group.ID, op)
+			}
 			mct = true
 		default:
 			return nil, fmt.Errorf("test group %d has unknown type %q", group.ID, group.Type)
@@ -96,6 +217,10 @@ func (b *blockCipher) Process(vectorSet []byte) (interface{}, error) {
 			return nil, fmt.Errorf("test group %d contains non-byte-multiple key length %d", group.ID, group.KeyBits)
 		}
 		keyBytes := group.KeyBits / 8
+
+		transact := func(n int, args ...[]byte) ([][]byte, error) {
+			return m.Transact(op, n, args...)
+		}
 
 		for _, test := range group.Tests {
 			if len(test.KeyHex) != keyBytes*2 {
@@ -114,12 +239,21 @@ func (b *blockCipher) Process(vectorSet []byte) (interface{}, error) {
 				inputHex = test.CiphertextHex
 			}
 
+			if test.InputBits != nil {
+				if *test.InputBits%8 != 0 {
+					return nil, fmt.Errorf("input to test case %d/%d is not a whole number of bytes", group.ID, test.ID)
+				}
+				if inputBits := 4 * uint64(len(inputHex)); *test.InputBits != inputBits {
+					return nil, fmt.Errorf("input to test case %d/%d is %q (%d bits), but %d bits is specified", group.ID, test.ID, inputHex, inputBits, *test.InputBits)
+				}
+			}
+
 			input, err := hex.DecodeString(inputHex)
 			if err != nil {
 				return nil, fmt.Errorf("failed to decode hex in test case %d/%d: %s", group.ID, test.ID, err)
 			}
 
-			if len(input)%b.blockSize != 0 {
+			if b.inputsAreBlockMultiples && len(input)%b.blockSize != 0 {
 				return nil, fmt.Errorf("test case %d/%d has input of length %d, but expected multiple of %d", group.ID, test.ID, len(input), b.blockSize)
 			}
 
@@ -139,9 +273,9 @@ func (b *blockCipher) Process(vectorSet []byte) (interface{}, error) {
 				var err error
 
 				if b.hasIV {
-					result, err = b.m.transact(op, 1, key, input, iv)
+					result, err = m.Transact(op, b.numResults, key, input, iv, uint32le(1))
 				} else {
-					result, err = b.m.transact(op, 1, key, input)
+					result, err = m.Transact(op, b.numResults, key, input, uint32le(1))
 				}
 				if err != nil {
 					panic("block operation failed: " + err.Error())
@@ -153,93 +287,7 @@ func (b *blockCipher) Process(vectorSet []byte) (interface{}, error) {
 					testResp.PlaintextHex = hex.EncodeToString(result[0])
 				}
 			} else {
-				for i := 0; i < 100; i++ {
-					var iteration blockCipherMCTResult
-					iteration.KeyHex = hex.EncodeToString(key)
-					if encrypt {
-						iteration.PlaintextHex = hex.EncodeToString(input)
-					} else {
-						iteration.CiphertextHex = hex.EncodeToString(input)
-					}
-
-					var result, prevResult []byte
-					if !b.hasIV {
-						for j := 0; j < 1000; j++ {
-							prevResult = input
-							result, err := b.m.transact(op, 1, key, input)
-							if err != nil {
-								panic("block operation failed")
-							}
-							input = result[0]
-						}
-						result = input
-					} else {
-						iteration.IVHex = hex.EncodeToString(iv)
-
-						var prevInput []byte
-						for j := 0; j < 1000; j++ {
-							prevResult = result
-							if j > 0 {
-								if encrypt {
-									iv = result
-								} else {
-									iv = prevInput
-								}
-							}
-
-							results, err := b.m.transact(op, 1, key, input, iv)
-							if err != nil {
-								panic("block operation failed")
-							}
-							result = results[0]
-
-							prevInput = input
-							if j == 0 {
-								input = iv
-							} else {
-								input = prevResult
-							}
-						}
-					}
-
-					if encrypt {
-						iteration.CiphertextHex = hex.EncodeToString(result)
-					} else {
-						iteration.PlaintextHex = hex.EncodeToString(result)
-					}
-
-					switch keyBytes {
-					case 16:
-						for i := range key {
-							key[i] ^= result[i]
-						}
-					case 24:
-						for i := 0; i < 8; i++ {
-							key[i] ^= prevResult[i+8]
-						}
-						for i := range result {
-							key[i+8] ^= result[i]
-						}
-					case 32:
-						for i, b := range prevResult {
-							key[i] ^= b
-						}
-						for i, b := range result {
-							key[i+16] ^= b
-						}
-					default:
-						panic("unhandled key length")
-					}
-
-					if !b.hasIV {
-						input = result
-					} else {
-						iv = result
-						input = prevResult
-					}
-
-					testResp.MCTResults = append(testResp.MCTResults, iteration)
-				}
+				testResp.MCTResults = b.mctFunc(transact, encrypt, key, input, iv)
 			}
 
 			response.Tests = append(response.Tests, testResp)

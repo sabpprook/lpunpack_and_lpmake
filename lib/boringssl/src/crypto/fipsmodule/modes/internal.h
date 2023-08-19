@@ -52,7 +52,6 @@
 #include <openssl/base.h>
 
 #include <openssl/aes.h>
-#include <openssl/cpu.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -63,27 +62,6 @@
 extern "C" {
 #endif
 
-
-static inline uint32_t GETU32(const void *in) {
-  uint32_t v;
-  OPENSSL_memcpy(&v, in, sizeof(v));
-  return CRYPTO_bswap4(v);
-}
-
-static inline void PUTU32(void *out, uint32_t v) {
-  v = CRYPTO_bswap4(v);
-  OPENSSL_memcpy(out, &v, sizeof(v));
-}
-
-static inline size_t load_word_le(const void *in) {
-  size_t v;
-  OPENSSL_memcpy(&v, in, sizeof(v));
-  return v;
-}
-
-static inline void store_word_le(void *out, size_t v) {
-  OPENSSL_memcpy(out, &v, sizeof(v));
-}
 
 // block128_f is the type of an AES block cipher implementation.
 //
@@ -171,7 +149,7 @@ typedef struct {
     uint64_t u[2];
     uint32_t d[4];
     uint8_t c[16];
-    size_t t[16 / sizeof(size_t)];
+    crypto_word_t t[16 / sizeof(crypto_word_t)];
   } Yi, EKi, EK0, len, Xi;
 
   // Note that the order of |Xi| and |gcm_key| is fixed by the MOVBE-based,
@@ -261,30 +239,19 @@ OPENSSL_EXPORT void CRYPTO_gcm128_tag(GCM128_CONTEXT *ctx, uint8_t *tag,
 
 // GCM assembly.
 
-#if !defined(OPENSSL_NO_ASM) &&                         \
-    (defined(OPENSSL_X86) || defined(OPENSSL_X86_64) || \
-     defined(OPENSSL_ARM) || defined(OPENSSL_AARCH64) || \
-     defined(OPENSSL_PPC64LE))
-#define GHASH_ASM
-#endif
-
-void gcm_init_4bit(u128 Htable[16], const uint64_t H[2]);
-void gcm_gmult_4bit(uint64_t Xi[2], const u128 Htable[16]);
-void gcm_ghash_4bit(uint64_t Xi[2], const u128 Htable[16], const uint8_t *inp,
+void gcm_init_nohw(u128 Htable[16], const uint64_t H[2]);
+void gcm_gmult_nohw(uint64_t Xi[2], const u128 Htable[16]);
+void gcm_ghash_nohw(uint64_t Xi[2], const u128 Htable[16], const uint8_t *inp,
                     size_t len);
 
-#if defined(GHASH_ASM)
+#if !defined(OPENSSL_NO_ASM)
 
 #if defined(OPENSSL_X86) || defined(OPENSSL_X86_64)
-#define GCM_FUNCREF_4BIT
+#define GCM_FUNCREF
 void gcm_init_clmul(u128 Htable[16], const uint64_t Xi[2]);
 void gcm_gmult_clmul(uint64_t Xi[2], const u128 Htable[16]);
 void gcm_ghash_clmul(uint64_t Xi[2], const u128 Htable[16], const uint8_t *inp,
                      size_t len);
-
-OPENSSL_INLINE char gcm_ssse3_capable(void) {
-  return (OPENSSL_ia32cap_get()[1] & (1 << (41 - 32))) != 0;
-}
 
 // |gcm_gmult_ssse3| and |gcm_ghash_ssse3| require |Htable| to be
 // 16-byte-aligned, but |gcm_init_ssse3| does not.
@@ -309,14 +276,11 @@ size_t aesni_gcm_decrypt(const uint8_t *in, uint8_t *out, size_t len,
 
 #if defined(OPENSSL_X86)
 #define GHASH_ASM_X86
-void gcm_gmult_4bit_mmx(uint64_t Xi[2], const u128 Htable[16]);
-void gcm_ghash_4bit_mmx(uint64_t Xi[2], const u128 Htable[16], const uint8_t *inp,
-                        size_t len);
 #endif  // OPENSSL_X86
 
 #elif defined(OPENSSL_ARM) || defined(OPENSSL_AARCH64)
 #define GHASH_ASM_ARM
-#define GCM_FUNCREF_4BIT
+#define GCM_FUNCREF
 
 OPENSSL_INLINE int gcm_pmull_capable(void) {
   return CRYPTO_is_ARMv8_PMULL_capable();
@@ -336,13 +300,13 @@ void gcm_ghash_neon(uint64_t Xi[2], const u128 Htable[16], const uint8_t *inp,
 
 #elif defined(OPENSSL_PPC64LE)
 #define GHASH_ASM_PPC64LE
-#define GCM_FUNCREF_4BIT
+#define GCM_FUNCREF
 void gcm_init_p8(u128 Htable[16], const uint64_t Xi[2]);
 void gcm_gmult_p8(uint64_t Xi[2], const u128 Htable[16]);
 void gcm_ghash_p8(uint64_t Xi[2], const u128 Htable[16], const uint8_t *inp,
                   size_t len);
 #endif
-#endif  // GHASH_ASM
+#endif  // OPENSSL_NO_ASM
 
 
 // CBC.

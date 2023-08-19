@@ -20,6 +20,13 @@
 
 // Build benchmarks for the device. Run with:
 //   adb shell liblog-benchmarks
+package {
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // the below license kinds from "system_logging_liblog_license":
+    //   SPDX-license-identifier-Apache-2.0
+    default_applicable_licenses: ["system_logging_liblog_license"],
+}
+
 cc_benchmark {
     name: "liblog-benchmarks",
     cflags: [
@@ -72,6 +79,7 @@ cc_defaults {
     ],
     static_libs: ["liblog"],
     isolated: true,
+    require_root: true,
 }
 
 // Build tests for the device (with .so). Run with:
@@ -96,8 +104,9 @@ cc_test {
     cflags: ["-DNO_PSTORE"],
     test_suites: [
         "cts",
-        "vts10",
+        "device-tests",
     ],
+    test_config: "device_test_config.xml",
 }
 
 cc_test_host {

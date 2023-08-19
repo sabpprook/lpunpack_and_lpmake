@@ -171,7 +171,6 @@ void EC_KEY_free(EC_KEY *r) {
   EC_GROUP_free(r->group);
   EC_POINT_free(r->pub_key);
   ec_wrapped_scalar_free(r->priv_key);
-  BN_free(r->fixed_k);
 
   CRYPTO_free_ex_data(g_ec_ex_data_class_bss_get(), r, &r->ex_data);
 
@@ -292,10 +291,6 @@ void EC_KEY_set_conv_form(EC_KEY *key, point_conversion_form_t cform) {
 }
 
 int EC_KEY_check_key(const EC_KEY *eckey) {
-  int ok = 0;
-  BN_CTX *ctx = NULL;
-  EC_POINT *point = NULL;
-
   if (!eckey || !eckey->group || !eckey->pub_key) {
     OPENSSL_PUT_ERROR(EC, ERR_R_PASSED_NULL_PARAMETER);
     return 0;
@@ -303,70 +298,74 @@ int EC_KEY_check_key(const EC_KEY *eckey) {
 
   if (EC_POINT_is_at_infinity(eckey->group, eckey->pub_key)) {
     OPENSSL_PUT_ERROR(EC, EC_R_POINT_AT_INFINITY);
-    goto err;
+    return 0;
   }
 
-  ctx = BN_CTX_new();
-
-  if (ctx == NULL) {
-    goto err;
-  }
-
-  // testing whether the pub_key is on the elliptic curve
-  if (!EC_POINT_is_on_curve(eckey->group, eckey->pub_key, ctx)) {
+  // Test whether the public key is on the elliptic curve.
+  if (!EC_POINT_is_on_curve(eckey->group, eckey->pub_key, NULL)) {
     OPENSSL_PUT_ERROR(EC, EC_R_POINT_IS_NOT_ON_CURVE);
-    goto err;
+    return 0;
   }
-  // in case the priv_key is present :
-  // check if generator * priv_key == pub_key
+
+  // Check the public and private keys match.
+  //
+  // NOTE: this is a FIPS pair-wise consistency check for the ECDH case. See SP
+  // 800-56Ar3, page 36.
   if (eckey->priv_key != NULL) {
-    point = EC_POINT_new(eckey->group);
-    if (point == NULL ||
-        !ec_point_mul_scalar_base(eckey->group, &point->raw,
+    EC_RAW_POINT point;
+    if (!ec_point_mul_scalar_base(eckey->group, &point,
                                   &eckey->priv_key->scalar)) {
       OPENSSL_PUT_ERROR(EC, ERR_R_EC_LIB);
-      goto err;
+      return 0;
     }
-    if (EC_POINT_cmp(eckey->group, point, eckey->pub_key, ctx) != 0) {
+    if (!ec_GFp_simple_points_equal(eckey->group, &point,
+                                    &eckey->pub_key->raw)) {
       OPENSSL_PUT_ERROR(EC, EC_R_INVALID_PRIVATE_KEY);
-      goto err;
-    }
-  }
-  ok = 1;
-
-err:
-  BN_CTX_free(ctx);
-  EC_POINT_free(point);
-  return ok;
-}
-
-int EC_KEY_check_fips(const EC_KEY *key) {
-  if (EC_KEY_is_opaque(key)) {
-    // Opaque keys can't be checked.
-    OPENSSL_PUT_ERROR(EC, EC_R_PUBLIC_KEY_VALIDATION_FAILED);
-    return 0;
-  }
-
-  if (!EC_KEY_check_key(key)) {
-    return 0;
-  }
-
-  if (key->priv_key) {
-    uint8_t data[16] = {0};
-    ECDSA_SIG *sig = ECDSA_do_sign(data, sizeof(data), key);
-#if defined(BORINGSSL_FIPS_BREAK_ECDSA_PWCT)
-    data[0] = ~data[0];
-#endif
-    int ok = sig != NULL &&
-             ECDSA_do_verify(data, sizeof(data), sig, key);
-    ECDSA_SIG_free(sig);
-    if (!ok) {
-      OPENSSL_PUT_ERROR(EC, EC_R_PUBLIC_KEY_VALIDATION_FAILED);
       return 0;
     }
   }
 
   return 1;
+}
+
+int EC_KEY_check_fips(const EC_KEY *key) {
+  int ret = 0;
+  FIPS_service_indicator_lock_state();
+
+  if (EC_KEY_is_opaque(key)) {
+    // Opaque keys can't be checked.
+    OPENSSL_PUT_ERROR(EC, EC_R_PUBLIC_KEY_VALIDATION_FAILED);
+    goto end;
+  }
+
+  if (!EC_KEY_check_key(key)) {
+    goto end;
+  }
+
+  if (key->priv_key) {
+    uint8_t data[16] = {0};
+    ECDSA_SIG *sig = ECDSA_do_sign(data, sizeof(data), key);
+    if (boringssl_fips_break_test("ECDSA_PWCT")) {
+      data[0] = ~data[0];
+    }
+    int ok = sig != NULL &&
+             ECDSA_do_verify(data, sizeof(data), sig, key);
+    ECDSA_SIG_free(sig);
+    if (!ok) {
+      OPENSSL_PUT_ERROR(EC, EC_R_PUBLIC_KEY_VALIDATION_FAILED);
+      goto end;
+    }
+  }
+
+  ret = 1;
+
+end:
+  FIPS_service_indicator_unlock_state();
+  if (ret) {
+    EC_KEY_keygen_verify_service_indicator(key);
+  }
+
+  return ret;
 }
 
 int EC_KEY_set_public_key_affine_coordinates(EC_KEY *key, const BIGNUM *x,
@@ -394,7 +393,7 @@ err:
   return ok;
 }
 
-size_t EC_KEY_key2buf(EC_KEY *key, point_conversion_form_t form,
+size_t EC_KEY_key2buf(const EC_KEY *key, point_conversion_form_t form,
                       unsigned char **out_buf, BN_CTX *ctx) {
   if (key == NULL || key->pub_key == NULL || key->group == NULL) {
     return 0;
@@ -454,7 +453,17 @@ int EC_KEY_generate_key(EC_KEY *key) {
 }
 
 int EC_KEY_generate_key_fips(EC_KEY *eckey) {
-  return EC_KEY_generate_key(eckey) && EC_KEY_check_fips(eckey);
+  boringssl_ensure_ecc_self_test();
+
+  if (EC_KEY_generate_key(eckey) && EC_KEY_check_fips(eckey)) {
+    return 1;
+  }
+
+  EC_POINT_free(eckey->pub_key);
+  ec_wrapped_scalar_free(eckey->priv_key);
+  eckey->pub_key = NULL;
+  eckey->priv_key = NULL;
+  return 0;
 }
 
 int EC_KEY_get_ex_new_index(long argl, void *argp, CRYPTO_EX_unused *unused,
